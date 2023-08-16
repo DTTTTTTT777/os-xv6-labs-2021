@@ -66,7 +66,20 @@ usertrap(void)
 
     syscall();
   } else if((which_dev = devintr()) != 0){
-    // ok
+    if(which_dev == 2 && p->waitReturn == 0)
+    {
+      if(p->interval != 0)
+      {
+        p->spend = p->spend+1;
+        if(p->spend == p->interval)
+        {
+          switchTrapframe(p->trapframeSave,p->trapframe);
+          p->spend = 0;
+          p->trapframe->epc = (uint64)p->handler;
+          p->waitReturn = 1;
+        }
+      }
+    }
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
@@ -77,8 +90,9 @@ usertrap(void)
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
-    yield();
+  if (which_dev == 2) {
+        yield();
+  }
 
   usertrapret();
 }
@@ -216,5 +230,46 @@ devintr()
   } else {
     return 0;
   }
+}
+
+
+
+void switchTrapframe(struct trapframe* trapframe, struct trapframe *trapframeSave){
+  // 将 trapframeSave 中的所有成员复制到 trapframe 中
+trapframe->kernel_satp = trapframeSave->kernel_satp;
+trapframe->kernel_sp = trapframeSave->kernel_sp;
+trapframe->epc = trapframeSave->epc;
+trapframe->kernel_hartid = trapframeSave->kernel_hartid;
+trapframe->ra = trapframeSave->ra;
+trapframe->sp = trapframeSave->sp;
+trapframe->gp = trapframeSave->gp;
+trapframe->tp = trapframeSave->tp;
+trapframe->t0 = trapframeSave->t0;
+trapframe->t1 = trapframeSave->t1;
+trapframe->t2 = trapframeSave->t2;
+trapframe->s0 = trapframeSave->s0;
+trapframe->s1 = trapframeSave->s1;
+trapframe->a0 = trapframeSave->a0;
+trapframe->a1 = trapframeSave->a1;
+trapframe->a2 = trapframeSave->a2;
+trapframe->a3 = trapframeSave->a3;
+trapframe->a4 = trapframeSave->a4;
+trapframe->a5 = trapframeSave->a5;
+trapframe->a6 = trapframeSave->a6;
+trapframe->a7 = trapframeSave->a7;
+trapframe->s2 = trapframeSave->s2;
+trapframe->s3 = trapframeSave->s3;
+trapframe->s4 = trapframeSave->s4;
+trapframe->s5 = trapframeSave->s5;
+trapframe->s6 = trapframeSave->s6;
+trapframe->s7 = trapframeSave->s7;
+trapframe->s8 = trapframeSave->s8;
+trapframe->s9 = trapframeSave->s9;
+trapframe->s10 = trapframeSave->s10;
+trapframe->s11 = trapframeSave->s11;
+trapframe->t3 = trapframeSave->t3;
+trapframe->t4 = trapframeSave->t4;
+trapframe->t5 = trapframeSave->t5;
+trapframe->t6 = trapframeSave->t6;
 }
 

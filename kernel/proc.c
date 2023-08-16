@@ -119,6 +119,14 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  
+  p->spend = 0; // 将当前进程的 spend 成员设置为 0
+
+  if ((p->trapframeSave = (struct trapframe*)kalloc()) == 0) { 
+    // 为当前进程分配一个 trapframe 结构体
+    release(&p->lock); // 释放当前进程的锁
+    return 0; // 返回 0
+  }
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
