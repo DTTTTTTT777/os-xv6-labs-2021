@@ -65,7 +65,28 @@ usertrap(void)
     intr_on();
 
     syscall();
-  } else if((which_dev = devintr()) != 0){
+  } 
+  // 异常代码15：Fault Fetch（缺页错误）
+  // 异常代码13：Misaligned Fetch（对齐错误）
+  else if (r_scause() == 13 || r_scause() == 15) {
+      // 获取虚拟地址
+    uint64 va = r_stval();
+    // 检查是否为栈保护页
+    if (va < PGROUNDDOWN(p->trapframe->sp) &&
+      va >= PGROUNDDOWN(p->trapframe->sp) - PGSIZE) {
+      // 是栈保护页，杀死进程
+      p->killed = 1;
+    }
+    else {
+      int ret;
+      // 处理写时复制
+      if ((ret = cow_alloc(p->pagetable, va)) < 0) {
+        // 处理失败，杀死进程
+        p->killed = 1;
+      }
+    }
+  }
+  else if((which_dev = devintr()) != 0){
     // ok
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);

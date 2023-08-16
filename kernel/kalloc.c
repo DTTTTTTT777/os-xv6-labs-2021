@@ -21,13 +21,15 @@ struct run {
 struct {
   struct spinlock lock;
   struct run *freelist;
+  int rc[PHYSTOP / PGSIZE];
 } kmem;
+
 
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
-  freerange(end, (void*)PHYSTOP);
+  freerange(end, (void *)PHYSTOP);
 }
 
 void
@@ -35,8 +37,11 @@ freerange(void *pa_start, void *pa_end)
 {
   char *p;
   p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
-    kfree(p);
+  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE){
+        // 将 kmem.rc 数组中对应的元素设为 1
+    	kmem.rc[(uint64)p / PGSIZE] = 1;
+        kfree(p);
+    }
 }
 
 // Free the page of physical memory pointed at by v,
@@ -50,17 +55,18 @@ kfree(void *pa)
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
-
-  // Fill with junk to catch dangling refs.
-  memset(pa, 1, PGSIZE);
-
-  r = (struct run*)pa;
-
+    
   acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
+  kmem.rc[(uint64)pa / PGSIZE]--;
+  if (kmem.rc[(uint64)pa / PGSIZE] <= 0) {
+    memset(pa, 1, PGSIZE);
+    r = (struct run*)pa;
+    r->next = kmem.freelist;
+    kmem.freelist = r;
+  }
   release(&kmem.lock);
 }
+
 
 // Allocate one 4096-byte page of physical memory.
 // Returns a pointer that the kernel can use.
@@ -72,11 +78,76 @@ kalloc(void)
 
   acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r){
+    // 将空闲链表的头部指向下一个元素
     kmem.freelist = r->next;
+    // 设置引用计数为 1
+    kmem.rc[(uint64)r / PGSIZE] = 1;
+  }
+  // 释放 kmem.lock 锁
   release(&kmem.lock);
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
+}
+void 
+increase_rc(uint64 pa) {
+  // 获取 kmem.lock 锁
+  acquire(&kmem.lock);
+  // 增加 kmem.rc 数组中对应元素的值
+  kmem.rc[pa / PGSIZE]++;
+  // 释放 kmem.lock 锁
+  release(&kmem.lock);
+}
+
+
+int
+cow_alloc(pagetable_t pagetable, uint64 va) {
+  uint64 pa;
+  uint64 mem;
+  pte_t* pte;
+  // 检查虚拟地址是否合法
+  if (va >= MAXVA)
+    return -1;
+  // 获取虚拟地址所在页的起始地址
+  va = PGROUNDDOWN(va);
+  // 获取页表项
+  pte = walk(pagetable, va, 0);
+  // 检查页表项是否存在
+  if (pte == 0) {
+    return -1;
+  }
+  // 检查页是否有效且为 COW 页
+  if (!(*pte & PTE_V)) {
+    return -2;
+  }
+  // 获取物理地址
+  pa = PTE2PA(*pte);
+
+  // 如果引用计数为1，将其设置为可写
+  acquire(&kmem.lock);
+  if (kmem.rc[pa / PGSIZE] == 1) {
+    *pte &= ~PTE_COW;
+    *pte |= PTE_W;
+    release(&kmem.lock);
+    return 0;
+  }
+  release(&kmem.lock);
+
+  // 分配新的物理内存
+  if ((mem = (uint64)kalloc()) == 0) {
+    return -3;
+  }
+
+  // 复制内存内容
+  memmove((void*)mem, (void*)pa, PGSIZE);
+
+  // 更新页表项
+  *pte = ((PA2PTE(mem) | PTE_FLAGS(*pte) | PTE_W) & (~PTE_COW));
+
+  // 减少引用计数
+  kfree((void*)pa);
+
+  return 0;
 }

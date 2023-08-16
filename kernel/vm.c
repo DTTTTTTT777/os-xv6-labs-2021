@@ -159,9 +159,9 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   return 0;
 }
 
-// Remove npages of mappings starting from va. va must be
-// page-aligned. The mappings must exist.
-// Optionally free the physical memory.
+// create an empty user page table.
+// returns 0 if out of memory.
+
 void
 uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 {
@@ -186,8 +186,6 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
   }
 }
 
-// create an empty user page table.
-// returns 0 if out of memory.
 pagetable_t
 uvmcreate()
 {
@@ -303,7 +301,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -311,12 +308,18 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
+    *pte = (*pte & ~PTE_W) | PTE_COW; // Added: 将所有的pte的写权限都设置为0，PTE_COW设置为1
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    // 直接映射到子进程
+    if (flags & PTE_W) {
+      // 设置 COW 标志位，清除 W 标志位
+      flags = (flags | PTE_COW) & (~PTE_W);
+      *pte = PA2PTE(pa) | flags;
+    }
+    // 增加引用计数
+    increase_rc(pa);
+    // 在新页表中映射该页
+    if (mappages(new, i, PGSIZE, pa, flags) != 0) {
       goto err;
     }
   }
@@ -350,7 +353,9 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+    cow_alloc(pagetable, va0); // 分配写时复制页
     pa0 = walkaddr(pagetable, va0);
+    
     if(pa0 == 0)
       return -1;
     n = PGSIZE - (dstva - va0);
