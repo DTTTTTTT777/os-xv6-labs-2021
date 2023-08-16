@@ -103,6 +103,31 @@ e1000_transmit(struct mbuf *m)
   // a pointer so that it can be freed after sending.
   //
   
+  acquire(&e1000_lock); // 锁
+
+  int index = regs[E1000_TDT]; // 读取E1000_TDT控制寄存器，获取下一个数据包的TX环索引
+
+  if ((tx_ring[index].status & E1000_TXD_STAT_DD) == 0) { // 仍在发送
+      release(&e1000_lock);
+      return -1;
+  }
+
+  if (tx_mbufs[index]) // 释放上一个数据包
+      mbuffree(tx_mbufs[index]);
+
+  tx_mbufs[index] = m;
+  tx_ring[index].length = m->len;
+  tx_ring[index].addr = (uint64)m->head;
+
+  // E1000_TXD_CMD_RS表示报告状态位，表示当发送完该数据包时会产生一个中断报告状态
+  // E1000_TXD_CMD_EOP表示结束位，表示这是该数据包的最后一个描述符。
+  tx_ring[index].cmd = E1000_TXD_CMD_RS | E1000_TXD_CMD_EOP;
+  // 更新E1000_TDT控制寄存器，指向下一个数据包的发送环索引
+  // 因其是一个环状结构，故取模
+
+  regs[E1000_TDT] = (index + 1) % TX_RING_SIZE;
+  release(&e1000_lock);
+    
   return 0;
 }
 
@@ -115,6 +140,26 @@ e1000_recv(void)
   // Check for packets that have arrived from the e1000
   // Create and deliver an mbuf for each packet (using net_rx()).
   //
+  
+  while (1) {
+
+        int index = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+
+        if ((rx_ring[index].status & E1000_RXD_STAT_DD) == 0) {
+            // 已处理完
+            return;
+        }
+        rx_mbufs[index]->len = rx_ring[index].length;
+
+        // 向上传输
+        net_rx(rx_mbufs[index]);
+
+        // 置空
+        rx_mbufs[index] = mbufalloc(0);
+        rx_ring[index].status = 0;
+        rx_ring[index].addr = (uint64)rx_mbufs[index]->head;
+        regs[E1000_RDT] = index;
+    }
 }
 
 void
