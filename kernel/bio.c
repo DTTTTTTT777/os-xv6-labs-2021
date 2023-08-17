@@ -23,33 +23,49 @@
 #include "fs.h"
 #include "buf.h"
 
+#define NBUCKET 13 // Upper limit of hash buckets
+#define INTMAX 0x7fffffff
+
+int hash(uint dev, uint blockno) {return ((blockno) % NBUCKET);} // Hash function
+
 struct {
   struct spinlock lock;
   struct buf buf[NBUF];
 
-  // Linked list of all buffers, through prev/next.
-  // Sorted by how recently the buffer was used.
-  // head.next is most recent, head.prev is least.
-  struct buf head;
+  // Maintain NBUCKET buckets, each holding a linked list.
+  // Each bucket has its own lock to protect its list.
+  // The individual elements buf stored in each bucket
+  // have their own locks, serving as buffer locks.
+  struct buf bucket[NBUCKET];
+  struct spinlock bucket_locks[NBUCKET];
 } bcache;
 
 void
 binit(void)
-{
-  struct buf *b;
+{ 
+  initlock(&bcache.lock, "bcache_lock");
 
-  initlock(&bcache.lock, "bcache");
+    // Initialize buckets
+    char name[32];
+    for (int i = 0; i < NBUCKET; i++) {
+        snprintf(name, 32, "bucket_lock_%d", i);
+        initlock(&bcache.bucket_locks[i], name);
+        bcache.bucket[i].next = 0;
+    }
 
-  // Create linked list of buffers
-  bcache.head.prev = &bcache.head;
-  bcache.head.next = &bcache.head;
-  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    initsleeplock(&b->lock, "buffer");
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
-  }
+    // Initialize buffers
+    for (int i = 0; i < NBUF; i++) {
+        struct buf *b = &bcache.buf[i]; // Head pointer of the linked list
+        initsleeplock(&b->lock, "buffer");
+
+        b->lut = 0;
+        b->refcnt = 0;
+        b->curBucket = 0;
+
+        // Insert buffer into bucket[0]
+        b->next = bcache.bucket[0].next;
+        bcache.bucket[0].next = b;
+    }
 }
 
 // Look through buffer cache for block on device dev.
@@ -58,34 +74,117 @@ binit(void)
 static struct buf*
 bget(uint dev, uint blockno)
 {
-  struct buf *b;
+    uint index = hash(dev, blockno);
 
-  acquire(&bcache.lock);
+    acquire(&bcache.bucket_locks[index]);
+    struct buf *b = bcache.bucket[index].next;
 
-  // Is the block already cached?
-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
-    if(b->dev == dev && b->blockno == blockno){
-      b->refcnt++;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
+    // Search within the current bucket[index]
+    while (b) {
+        if (b->dev == dev && b->blockno == blockno) {
+            // Block found
+            b->refcnt++;
+            release(&bcache.bucket_locks[index]);
+            acquiresleep(&b->lock);
+            return b;
+        }
+        b = b->next;
     }
-  }
 
-  // Not cached.
-  // Recycle the least recently used (LRU) unused buffer.
-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
-    if(b->refcnt == 0) {
-      b->dev = dev;
-      b->blockno = blockno;
-      b->valid = 0;
-      b->refcnt = 1;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
+    // Not found in the current bucket, need to search in other buckets
+    // It's not safe to acquire other bucket locks while holding one bucket_lock
+    // Acquiring multiple bucket locks simultaneously can lead to deadlock
+    // So, release the current bucket lock first
+    release(&bcache.bucket_locks[index]);
+
+    // As other processes might have moved the block to another bucket,
+    // we need to check if the block is already in another bucket
+    // If it's already in another bucket, wait for its sleeplock and return
+    acquire(&bcache.lock);
+    b = bcache.bucket[index].next;
+    while (b) {
+        if (b->dev == dev && b->blockno == blockno) {
+            // Block has been moved to another bucket by another process
+            acquire(&bcache.bucket_locks[index]);
+            b->refcnt++;
+            release(&bcache.bucket_locks[index]);
+            release(&bcache.lock); // Release the bcache lock
+
+            // Re-acquire the block's sleeplock and return after waiting
+            acquiresleep(&b->lock);
+            return b;
+        }
+        b = b->next;
     }
-  }
-  panic("bget: no buffers");
+
+    // If the block is still not found, search for an empty buffer or LRU buffer
+    struct buf *LRUb = 0;
+    uint curBucket = -1;
+    uint lut = INTMAX;
+
+    for (int i = 0; i < NBUCKET; i++) {
+        acquire(&bcache.bucket_locks[i]);
+
+        b = &bcache.bucket[i];
+        int found = 0;
+
+        while (b->next) {
+            if (b->next->refcnt == 0 && LRUb == 0) {
+                // If an empty buffer is found and no empty buffer was found before
+                LRUb = b;
+                lut = b->next->lut;
+                found = 1;
+            }
+            else if (b->next->refcnt == 0 && b->next->lut < lut) {
+                // If an empty buffer is found and this buffer was used earlier
+                LRUb = b;
+                lut = b->next->lut;
+                found = 1;
+            }
+            b = b->next;
+        }
+        if (found) {
+            // LRUb has been updated, release the locks of the previously accessed buckets
+            if (curBucket != -1) {
+                // Release the lock of the previously accessed bucket
+                release(&bcache.bucket_locks[curBucket]);
+            }
+            curBucket = i;
+        }
+        else {
+            // If not found, release the lock of the accessed bucket
+            release(&bcache.bucket_locks[i]);
+        }
+    }
+    if (LRUb == 0) {
+        panic("bget: No buffer.");
+    }
+    else {
+        struct buf *p = LRUb->next;
+
+        if (curBucket != index) {
+            // Remove the LRUb node
+            LRUb->next = p->next;
+            release(&bcache.bucket_locks[curBucket]);
+
+            // Insert the LRUb node into the current bucket[index]
+            acquire(&bcache.bucket_locks[index]);
+            p->next = bcache.bucket[index].next;
+            bcache.bucket[index].next = p;
+        }
+
+        // Update information of LRUb
+        p->dev = dev;
+        p->blockno = blockno;
+        p->refcnt = 1;
+        p->valid = 0;
+        p->curBucket = index;
+
+        release(&bcache.bucket_locks[index]); // Release the bucket[index] lock
+        release(&bcache.lock);                // Release the bcache lock
+        acquiresleep(&p->lock);               // Acquire the sleeplock of LRUb
+        return p;
+    }
 }
 
 // Return a locked buf with the contents of the indicated block.
@@ -121,33 +220,29 @@ brelse(struct buf *b)
 
   releasesleep(&b->lock);
 
-  acquire(&bcache.lock);
-  b->refcnt--;
-  if (b->refcnt == 0) {
-    // no one is waiting for it.
-    b->next->prev = b->prev;
-    b->prev->next = b->next;
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
-  }
-  
-  release(&bcache.lock);
+  uint index = hash(b->dev, b->blockno);
+    acquire(&bcache.bucket_locks[index]);
+    b->refcnt--;
+    if (b->refcnt == 0) 
+        b->lut = ticks;
+    release(&bcache.bucket_locks[index]);
 }
 
-void
-bpin(struct buf *b) {
-  acquire(&bcache.lock);
-  b->refcnt++;
-  release(&bcache.lock);
+void bpin(struct buf *b)
+{
+
+    uint index = hash(b->dev, b->blockno);
+    acquire(&bcache.bucket_locks[index]);
+    b->refcnt++;
+    release(&bcache.bucket_locks[index]);
 }
 
-void
-bunpin(struct buf *b) {
-  acquire(&bcache.lock);
-  b->refcnt--;
-  release(&bcache.lock);
-}
+void bunpin(struct buf *b)
+{
 
+    uint index = hash(b->dev, b->blockno);
+    acquire(&bcache.bucket_locks[index]);
+    b->refcnt--;
+    release(&bcache.bucket_locks[index]);
+}
 
