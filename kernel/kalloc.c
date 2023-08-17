@@ -18,15 +18,31 @@ struct run {
   struct run *next;
 };
 
+/*struct {
+  struct spinlock lock;
+  struct run *freelist;
+} kmem;*/
+
+//Added----------------------------------beg
 struct {
   struct spinlock lock;
   struct run *freelist;
-} kmem;
+} kmem[NCPU]; // 为每个 CPU 分配独立的kmem 
+//Added----------------------------------end
 
 void
 kinit()
 {
-  initlock(&kmem.lock, "kmem");
+  //initlock(&kmem.lock, "kmem");
+  
+  //Added----------------------------------beg
+  char kmem_name[32];
+  for (int i = 0; i < NCPU; i++) {
+      snprintf(kmem_name, 32, "kmem_%d", i);
+      initlock(&kmem[i].lock, kmem_name); //init all locks
+  }
+  //Added----------------------------------end
+  
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -56,10 +72,25 @@ kfree(void *pa)
 
   r = (struct run*)pa;
 
-  acquire(&kmem.lock);
+  /*acquire(&kmem.lock);
   r->next = kmem.freelist;
   kmem.freelist = r;
-  release(&kmem.lock);
+  release(&kmem.lock);*/
+  
+  
+  //Added------------------------------beg
+  push_off();
+
+  int cpu = cpuid();
+
+  acquire(&kmem[cpu].lock);
+  r->next = kmem[cpu].freelist;
+  kmem[cpu].freelist = r;
+  release(&kmem[cpu].lock);
+
+  pop_off();
+  //Added------------------------------end
+  
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -70,11 +101,40 @@ kalloc(void)
 {
   struct run *r;
 
-  acquire(&kmem.lock);
-  r = kmem.freelist;
+  /*acquire(&kmem.lock);
+  r = kmem.freelist;*/
+  
+  //Added
+  push_off();
+  int CPUID = cpuid();
+  acquire(&kmem[CPUID].lock);
+  r = kmem[CPUID].freelist;
+  
   if(r)
-    kmem.freelist = r->next;
-  release(&kmem.lock);
+    //kmem.freelist = r->next;
+    kmem[CPUID].freelist = r->next; //Added
+    
+  if (r == 0) { // 若当前CPU上没有空闲页
+        // 在其他CPU上查找空闲页
+        for (int i = 0; i < NCPU; i++) {
+            if (i == CPUID)
+                continue;
+            // 获取其他CPU的锁
+            acquire(&kmem[i].lock);
+            r = kmem[i].freelist;
+            if (r)
+                kmem[i].freelist = r->next;
+            release(&kmem[i].lock);
+            if (r) // 已找到
+                break;
+        }
+    }
+
+    //release(&kmem.lock); 
+    
+    release(&kmem[CPUID].lock);
+    pop_off();
+  
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
