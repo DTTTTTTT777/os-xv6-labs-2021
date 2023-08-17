@@ -374,66 +374,146 @@ iunlockput(struct inode *ip)
 
 // Return the disk block address of the nth block in inode ip.
 // If there is no such block, bmap allocates one.
-static uint
-bmap(struct inode *ip, uint bn)
+static uint bmap(struct inode *ip, uint bn)
 {
-  uint addr, *a;
-  struct buf *bp;
+    uint addr, *a;
+    struct buf *bp;
 
-  if(bn < NDIRECT){
-    if((addr = ip->addrs[bn]) == 0)
-      ip->addrs[bn] = addr = balloc(ip->dev);
-    return addr;
-  }
-  bn -= NDIRECT;
-
-  if(bn < NINDIRECT){
-    // Load indirect block, allocating if necessary.
-    if((addr = ip->addrs[NDIRECT]) == 0)
-      ip->addrs[NDIRECT] = addr = balloc(ip->dev);
-    bp = bread(ip->dev, addr);
-    a = (uint*)bp->data;
-    if((addr = a[bn]) == 0){
-      a[bn] = addr = balloc(ip->dev);
-      log_write(bp);
+    if (bn < NDIRECT) {
+        if ((addr = ip->addrs[bn]) == 0) {
+            addr = balloc(ip->dev);
+            if (addr == 0) {
+                return 0;
+            }
+            ip->addrs[bn] = addr;
+        }
+        return addr;
     }
-    brelse(bp);
-    return addr;
-  }
 
-  panic("bmap: out of range");
+    bn -= NDIRECT; 
+    if (bn < NINDIRECT) {
+        if ((addr = ip->addrs[NDIRECT]) == 0) {
+            addr = balloc(ip->dev);
+            if (addr == 0) {
+                return 0;
+            }
+            ip->addrs[NDIRECT] = addr;
+        }
+
+        bp = bread(ip->dev, addr); 
+        a = (uint *)bp->data;
+        if ((addr = a[bn]) == 0) {
+            addr = balloc(ip->dev);
+            if (addr == 0) {
+                brelse(bp);
+                return 0;
+            }
+            a[bn] = addr;
+            log_write(bp);
+        }
+        brelse(bp);
+        return addr;
+    }
+
+    bn -= NINDIRECT;
+    if (bn < NINDIRECT * NINDIRECT) {
+
+        uint iL1 = bn / NINDIRECT; // 一级索引
+        uint iL2 = bn % NINDIRECT; // 二级索引
+
+        if ((addr = ip->addrs[NDIRECT + 1]) == 0) {
+            addr = balloc(ip->dev);
+            if (addr == 0) {
+                return 0;
+            }
+            ip->addrs[NDIRECT + 1] = addr;
+        }
+        bp = bread(ip->dev, addr); 
+        a = (uint *)bp->data;
+        if ((addr = a[iL1]) == 0) {
+            // 如果对应的二级索引目录不存在，分配一个新的物理块，并将其记录在一级索引目录中
+            addr = balloc(ip->dev);
+            if (addr == 0) {
+                brelse(bp);
+                return 0;
+            }
+            a[iL1] = addr;
+            log_write(bp);
+        }
+        brelse(bp); 
+
+        bp = bread(ip->dev, addr);
+        a = (uint *)bp->data;
+        if ((addr = a[iL2]) == 0) {
+            // 如果对应的物理块号不存在，分配一个新的物理块，并将其记录在二级索引目录中
+            addr = balloc(ip->dev);
+            if (addr == 0) {
+                brelse(bp);
+                return 0;
+            }
+            a[iL2] = addr;
+            log_write(bp);
+        }
+        brelse(bp);
+        return addr;
+    }
+
+    panic("bmap: out of range");
 }
 
 // Truncate inode (discard contents).
 // Caller must hold ip->lock.
-void
-itrunc(struct inode *ip)
+void itrunc(struct inode *ip)
 {
-  int i, j;
-  struct buf *bp;
-  uint *a;
+    int i, j;
+    struct buf *bp;
+    uint *a;
 
-  for(i = 0; i < NDIRECT; i++){
-    if(ip->addrs[i]){
-      bfree(ip->dev, ip->addrs[i]);
-      ip->addrs[i] = 0;
+    for (i = 0; i < NDIRECT; i++) {
+        if (ip->addrs[i]) {
+            bfree(ip->dev, ip->addrs[i]);
+            ip->addrs[i] = 0;
+        }
     }
-  }
 
-  if(ip->addrs[NDIRECT]){
-    bp = bread(ip->dev, ip->addrs[NDIRECT]);
-    a = (uint*)bp->data;
-    for(j = 0; j < NINDIRECT; j++){
-      if(a[j])
-        bfree(ip->dev, a[j]);
+    // 释放一级索引目录对应的物理块
+    if (ip->addrs[NDIRECT]) {
+        bp = bread(ip->dev, ip->addrs[NDIRECT]);
+        a = (uint *)bp->data;
+        for (j = 0; j < NINDIRECT; j++) {
+            if (a[j])
+                bfree(ip->dev, a[j]);
+        }
+        brelse(bp);
+        bfree(ip->dev, ip->addrs[NDIRECT]);
+        ip->addrs[NDIRECT] = 0;
     }
-    brelse(bp);
-    bfree(ip->dev, ip->addrs[NDIRECT]);
-    ip->addrs[NDIRECT] = 0;
-  }
 
-  ip->size = 0;
-  iupdate(ip);
+    struct buf *bpL2;
+    uint *b;
+    int k;
+    // 释放二级索引目录对应的物理块
+    if (ip->addrs[NDIRECT + 1]) {
+        bp = bread(ip->dev, ip->addrs[NDIRECT + 1]);
+        a = (uint *)bp->data;
+        for (j = 0; j < NINDIRECT; j++) {
+            if (a[j]) {
+                bpL2 = bread(ip->dev, a[j]);
+                b = (uint *)bpL2->data;
+                for (k = 0; k < NINDIRECT; k++) {
+                    if (b[k])
+                        bfree(ip->dev, b[k]);
+                }
+                brelse(bpL2);
+                bfree(ip->dev, a[j]);
+            }
+        }
+        brelse(bp);
+        bfree(ip->dev, ip->addrs[NDIRECT + 1]);
+        ip->addrs[NDIRECT + 1] = 0;
+    }
+    ip->size = 0;
+    iupdate(ip);
 }
 
 // Copy stat information from inode.
