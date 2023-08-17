@@ -58,3 +58,4 @@ struct dirent {
   char name[DIRSIZ];
 };
 
+#define NSYMLINK 10 // 软链接的最大递归次数
